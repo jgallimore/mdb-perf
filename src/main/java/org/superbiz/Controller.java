@@ -32,9 +32,9 @@ import javax.ws.rs.Produces;
 
 import java.lang.management.ManagementFactory;
 import java.util.Set;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.logging.Logger;
 
 import static javax.ejb.LockType.READ;
 import static javax.ejb.LockType.WRITE;
@@ -46,50 +46,72 @@ import static javax.ws.rs.core.MediaType.APPLICATION_JSON;
 @Produces(APPLICATION_JSON)
 public class Controller {
 
-    private long startTime = 0;
-    private long endTime = 0;
-    private long startMessageCount;
-    private AtomicBoolean running = new AtomicBoolean(false);
-    private CountDownLatch latch = null;
+    private final Logger logger = Logger.getLogger(Controller.class.getName());
+
+    private AtomicReference<TestState> stateRef = null;
 
     @GET
     @Path("start")
     @Lock(WRITE)
-    public void start() throws Exception {
-        startTime = System.nanoTime();
-        endTime = 0;
-        running.set(true);
-        startMessageCount = getQueueDepth();
-        latch = new CountDownLatch(1000000);
+    public Long start() throws Exception {
+        long startMessageCount = getQueueDepth();
+        logger.info("Starting new test with " + startMessageCount + " in the queue.");
 
+        stateRef = new AtomicReference<>(TestState.start(startMessageCount));
         startEndpoint();
+
+        return startMessageCount;
     }
 
     @Path("stop")
     @Lock(WRITE)
     public void stop() throws Exception {
+        if (stateRef == null) {
+            throw new IllegalStateException("Test has not been started");
+        }
+
+        final TestState ts = stateRef.get();
+        if (ts.complete() && ts.getCompletionTime() == 0) {
+            logState(stateRef.updateAndGet(TestState::stop));
+        }
+
         stopEndpoint();
-        endTime = System.nanoTime();
-        running.set(false);
+    }
+
+    private void logState(final TestState state) {
+        final long timeElapsed = state.getTimeElapsed();
+        long seconds = TimeUnit.SECONDS.convert(timeElapsed, TimeUnit.NANOSECONDS);
+        final double rate = seconds == 0 ? 0 : ((double) state.getMessagesProcessed() / (double) seconds);
+
+        logger.info("Test completed. " + state.getMessagesProcessed() + " at a rate of " + rate + " messages/sec.");
     }
 
     @GET
-    public Stats stats() throws Exception {
-        final long queueDepth = getQueueDepth();
-        final long messagesProcessed = 1000000 - queueDepth;
-        final long timeElapsed = running.get() ? (System.nanoTime() - startTime) : (endTime - startTime);
+    public Stats stats() {
+        final TestState ts = stateRef.get();
+
+        final long timeElapsed = ts.getTimeElapsed();
         long seconds = TimeUnit.SECONDS.convert(timeElapsed, TimeUnit.NANOSECONDS);
 
-        final double rate = seconds == 0 ? 0 : ((double)messagesProcessed / (double)seconds);
-        return new Stats(timeElapsed, messagesProcessed, queueDepth, getInstanceCount(), getInstanceLimit(), rate);
+        final double rate = seconds == 0 ? 0 : ((double) ts.getMessagesProcessed() / (double) seconds);
+        return new Stats(
+                timeElapsed,
+                ts.getMessagesProcessed(),
+                ts.getTotalMessages() - ts.getMessagesProcessed(),
+                rate
+        );
     }
 
-    public void countDown() throws Exception {
-        if (latch != null) {
-            latch.countDown();
+    // READ lock
+    public void messageProcessed() throws Exception {
+        if (stateRef != null) {
+            // we could call stop() from here, but this method should not
+            // have any side-effects, and may be called multiple times
+            // by updateAndGet().
+            final TestState updated = this.stateRef.updateAndGet(TestState::incrementMessagesProcessed);
 
-            if (latch.getCount() == 0) {
-                stop();
+            if (updated.complete() && updated.getCompletionTime() == 0) {
+                logState(this.stateRef.updateAndGet(TestState::stop));
             }
         }
     }
@@ -116,17 +138,6 @@ public class Controller {
         return objectInstances.iterator().next();
     }
 
-    private ObjectInstance getInstanceStats(final MBeanServer mBeanServer) throws MalformedObjectNameException {
-        final Set<ObjectInstance> objectInstances = mBeanServer.queryMBeans(new ObjectName("openejb.management:J2EEServer=openejb,J2EEApplication=<empty>,EJBModule=*,MessageDrivenBean=SimpleMessageProcessor,j2eeType=Instances,name=SimpleMessageProcessor"), null);
-
-        if (objectInstances == null || objectInstances.isEmpty()) {
-            throw new RuntimeException("Unable to find Endpoint control MDB");
-        }
-
-        return objectInstances.iterator().next();
-    }
-
-
     private long getQueueDepth() throws MalformedObjectNameException, AttributeNotFoundException, MBeanException, ReflectionException, InstanceNotFoundException {
         final MBeanServer mBeanServer = ManagementFactory.getPlatformMBeanServer();
         final ObjectName objectName = new ObjectName("org.apache.activemq:type=Broker,brokerName=localhost,destinationType=Queue,destinationName=test");
@@ -136,21 +147,6 @@ public class Controller {
             throw new RuntimeException("Unable to find Queue MDB");
         }
 
-        final long queueSize = (long) mBeanServer.getAttribute(objectName, "QueueSize");
-        return queueSize;
-    }
-
-    private int getInstanceCount() throws MalformedObjectNameException, AttributeNotFoundException, MBeanException, ReflectionException, InstanceNotFoundException {
-//        final MBeanServer mBeanServer = ManagementFactory.getPlatformMBeanServer();
-//        final ObjectInstance objectInstance = getInstanceStats(mBeanServer);
-//        return (int) mBeanServer.getAttribute(objectInstance.getObjectName(), "InstanceCount");
-        return 0;
-    }
-
-    private int getInstanceLimit() throws MalformedObjectNameException, AttributeNotFoundException, MBeanException, ReflectionException, InstanceNotFoundException {
-//        final MBeanServer mBeanServer = ManagementFactory.getPlatformMBeanServer();
-//        final ObjectInstance objectInstance = getInstanceStats(mBeanServer);
-//        return (int) mBeanServer.getAttribute(objectInstance.getObjectName(), "InstanceLimit");
-        return 0;
+        return (long) mBeanServer.getAttribute(objectName, "QueueSize");
     }
 }

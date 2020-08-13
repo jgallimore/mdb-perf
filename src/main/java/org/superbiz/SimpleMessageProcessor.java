@@ -27,7 +27,7 @@ public class SimpleMessageProcessor implements MessageListener {
     public void onMessage(final Message message) {
         // no-op
         try {
-            controller.countDown();
+            controller.messageProcessed();
         } catch (Exception e) {
             e.printStackTrace();
         }
